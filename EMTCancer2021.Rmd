@@ -1,0 +1,1300 @@
+---
+title: "EMT Cancer 2021 Workflow"
+author: "Dan Ramirez"
+date: "8/13/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## R and Python installation/setup
+
+First, make sure you have R version 4.0.3 installed. To install R, visit https://www.r-project.org/
+RStudio is also recommended as an IDE and debugging tool.
+
+Next, make sure python 3.7 is installed and the necessary modules.
+Open a terminal window and run the commands below (on Mac):
+```{bash inst_python, eval=FALSE}
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+
+brew install python@3.7
+pip3 install pandas numpy seaborn dask arboreto
+pip3 install pyscenic==0.11.0
+```
+
+
+## Data download and preprocessing
+```{r 1_preproc, eval=FALSE}
+# Prepare data for processing
+# First, install the needed packages from CRAN
+install.packages(c("stringr", "jsonlite", "sjmisc", "MASS", "UpSetR", "ggplot2", "googledrive","dplyr"))
+install.packages(c("varhandle", "plyr", "ggpmisc", "spatstat.utils", "umap", "ggthemes","RColorBrewer")) # rowr?
+
+install.packages("BiocManager")
+BiocManager::install("Seurat")
+
+library(remotes)
+remotes::install_version("spatstat", version = "1.64-1")
+
+rm(list = ls()) # clean workspace
+
+library(Seurat)
+library(stringr)
+library(sjmisc)
+library(MASS)
+library(googledrive)
+
+cancers <- c("A549","DU145","MCF7","OVCA420")
+treatments <- c("EGF","TGFB1","TNF")
+
+fIDs <- c("1BJePXMkn_-iOsanOkx5fJO5vDVpLgfLe",       # A549_EGF.rds
+          "19aRaQ29uWNxQOSlyuzxEychHNseFK-kR",      # A549_TGFB1.rds
+          "1ffnfyx1siBFzgSJENx98xvHdeqOifXH5",     # A549_TNF.rds
+          "1mLIBRFrLvvcjBFoX6vBZ4ehiJ1zxIaVF",     # DU145_EGF.rds
+          "1uMNae00bJ8AfP4u9IwZYF29S67tAz0Tj",     # DU145_TGFB1.rds
+          "1cKo8xXB_rEG6JI3rMXDIQHtDhAgfns92",     # DU145_TNF.rds
+          "130Mao1De6lGaQSw9_hzLXuW9cfPROX7z",     # MCF7_EGF.rds
+          "1Jd8JvfaIvq4yqLkgbNRPj5OBGBd0J4Vu",     # MCF7_TGFB1.rds
+          "1K43TgiAh_Chql6XPKud0oOhr4c_s_sxU",     # MCF7_TNF.rds
+          "1J2oUOJlTeZDCX-1A5akGCA6jofUj1Tfn",     # OVCA420_EGF.rds
+          "1dnN6BoZP3GZj62_GAEWEqwgohpRVbO3k",     # OVCA420_TGFB1.rds
+          "1O4Yt-qaZFX1is3uT_OZqYJmrKukJrJUA"      # OVCA420_EGF.rds
+)
+
+dir <- "data" # Directory where the downloaded rds files are stored. From: https://drive.google.com/drive/folders/1lZ38Uj2ZjmFus7XbHGTATh8f9MqXLAf_
+if(!dir.exists(dir)) {
+  dir.create(dir)
+}
+
+# Loop through google drive IDs above & download data
+# You must run the function drive_auth() to login before downloading files
+treatmentIDs <- rep(c(1:3),4)
+for(fID in seq_along(fIDs)) {
+  cID <- ceiling(fID / 3)
+  tID <- treatmentIDs[fID]
+  destName <- paste0(cancers[cID],"_",treatments[tID],".rds")
+  drive_download(as_id(fIDs[fID]), path = file.path(dir,destName), overwrite = T)
+}
+
+files <- list.files(dir, pattern = ".\\.rds")
+
+for(i in seq_along(files)){
+  filename <- file.path(dir,files[i])
+  data <- readRDS(filename)
+  fwd <- subset(data, Time %in% c("0d", "1d", "3d", "7d", "8h"))
+  tmp <- as.matrix(Seurat::GetAssayData(fwd[["RNA"]], slot = "data"))
+  write.table(tmp,row.names = TRUE,col.names = TRUE, sep = "\t", file = file.path(dir,paste0(tools::file_path_sans_ext(files[i]),"_fwd.tsv")),quote = FALSE)
+  rm(tmp,fwd)
+  rev <- subset(data, Time %in% c("8h_rm", "1d_rm","3d_rm", "7d"))
+  tmp <- as.matrix(Seurat::GetAssayData(rev[["RNA"]], slot = "data"))
+  write.table(tmp,row.names = TRUE,col.names = TRUE, sep = "\t", file = file.path(dir,paste0(tools::file_path_sans_ext(files[i]),"_rev.tsv")),quote = FALSE)
+  
+}
+
+## Next, we'll set up the directory structure for the python script
+resultsDir <- file.path(getwd(),"results")
+dir.create(resultsDir)
+resourceDir <- file.path(getwd(),"resources")
+dir.create(resourceDir)
+databaseDir <- file.path(getwd(),"databases")
+dir.create(databaseDir)
+
+# download a list of known TFs in the human genome
+download.file("https://raw.githubusercontent.com/aertslab/pySCENIC/master/resources/hs_hgnc_curated_tfs.txt",
+              destfile = file.path(resourceDir,"hs_hgnc_curated_tfs.txt"))
+
+# download motif databases from CisTarget (resources.aertslab.org/cistarget)
+# here, we use the 7-species databases, using 500bpUp, TSS+/-10kbp, and TSS+/-5kbp
+# the options command can adjust the default time-out parameter - this may need to be increased w/ slow internet connection
+options(timeout = 1800)
+download.file("https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg19/refseq_r45/mc9nr/gene_based/hg19-500bp-upstream-7species.mc9nr.feather",
+              destfile = file.path(databaseDir,"hg19-500bp-upstream-7species.mc9nr.feather"))
+
+download.file("https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg19/refseq_r45/mc9nr/gene_based/hg19-tss-centered-10kb-7species.mc9nr.feather",
+              destfile = file.path(databaseDir,"hg19-tss-centered-10kb-7species.mc9nr.feather"))
+
+download.file("https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg19/refseq_r45/mc9nr/gene_based/hg19-tss-centered-5kb-7species.mc9nr.feather",
+              destfile = file.path(databaseDir,"hg19-tss-centered-5kb-7species.mc9nr.feather"))
+
+# download motif annotations from CisTarget
+download.file("https://resources.aertslab.org/cistarget/motif2tf/motifs-v9-nr.hgnc-m0.001-o0.0.tbl",
+              destfile = file.path(databaseDir,"motifs-v9-nr.hgnc-m0.001-o0.0.tbl"))
+options(timeout = 60)
+```
+
+
+## pySCENIC
+To run pySCENIC, use the following script with the .tsv files generated during preprocessing as input. Do not include the file extension here.
+The bash command below demonstrates an example:
+
+```{bash run_pySCENIC, eval=FALSE}
+python3 2_scenic_run.py OVCA420_TGFB1_rev
+```
+
+Below is the complete python script.
+```{python 2_scenic_run, eval=FALSE}
+if __name__ == '__main__':
+	import os
+	import glob
+	import pickle
+	import pandas as pd
+	import numpy as np
+	import json
+	import seaborn as sns
+	import sys
+
+	from dask.diagnostics import ProgressBar
+	from arboreto.utils import load_tf_names
+	from arboreto.algo import grnboost2
+	from pyscenic.rnkdb import FeatherRankingDatabase as RankingDatabase
+	from pyscenic.utils import modules_from_adjacencies, load_motifs
+	from pyscenic.prune import prune2df, df2regulons
+	from pyscenic.aucell import aucell
+
+
+	inputFilename = sys.argv[1] # Name of the specific data file provided as input through the shell script file
+	RESULT_FOLDER = "results"
+	DATA_FOLDER = "data"
+	RESOURCES_FOLDER = "resources"
+	DATABASE_FOLDER = "databases"
+	DATABASES_GLOB = os.path.join(DATABASE_FOLDER, "hg19*.mc9nr.feather")
+	MOTIF_ANNOTATIONS_FNAME = os.path.join(DATABASE_FOLDER, "motifs-v9-nr.hgnc-m0.001-o0.0.tbl")
+	MM_TFS_FNAME = os.path.join(RESOURCES_FOLDER, 'hs_hgnc_curated_tfs.txt')
+	SC_EXP_FNAME = os.path.join(DATA_FOLDER, (inputFilename + ".tsv"))
+	MODULES_FNAME = os.path.join(RESULT_FOLDER, ("modules_" + inputFilename + ".p"))
+	REGULONS_FNAME = os.path.join(RESULT_FOLDER, "regulons_" + inputFilename + ".p")
+	MOTIFS_FNAME = os.path.join(RESULT_FOLDER, "motifs_" + inputFilename + ".csv")
+
+	ex_matrix = pd.read_csv(SC_EXP_FNAME, sep='\t', header=0, index_col=0).T
+	print(ex_matrix.shape)
+	tf_names = load_tf_names(MM_TFS_FNAME)
+	print("tf names loaded")
+	out_file = os.path.join(RESULT_FOLDER, "grn_output_" + inputFilename + ".tsv")
+	db_fnames = glob.glob(DATABASES_GLOB)
+
+
+	def name(fname):
+		return os.path.splitext(os.path.basename(fname))[0]
+
+
+	dbs = [RankingDatabase(fname=fname, name=name(fname)) for fname in db_fnames]
+	print(dbs)
+	print("running grnboost")
+	print("tf_names head")
+	print(tf_names[1:5])
+	#print("gene names head")
+	#print(ex_matrix.iloc[1:5,1:5])
+	adjacencies = grnboost2(ex_matrix, tf_names=tf_names, verbose=True)
+	adjacencies.head()
+	print("identify modules")
+	adjacencies.to_csv(out_file, sep='\t', index=False, header=False)
+	print("grnboost done")
+	modules = list(modules_from_adjacencies(adjacencies, ex_matrix, rho_mask_dropouts=True))
+
+	#print("writing modules")
+	#with open(MODULES_FNAME, 'wb') as f:
+	#	pickle.dump(modules, f)
+
+	print("Finding Enriched modules")
+	# Calculate a list of enriched motifs and the corresponding target genes for all modules.
+
+	with ProgressBar():
+		df = prune2df(dbs, modules, MOTIF_ANNOTATIONS_FNAME)
+		df.head()
+
+	# Create regulons from this table of enriched motifs.
+	print("creating regulons")
+	regulons = df2regulons(df)
+
+	print("writing regulons")
+	# Save the enriched motifs and the discovered regulons to disk.
+	#df.to_csv(MOTIFS_FNAME)
+	#with open(REGULONS_FNAME, "wb") as f:
+	#	pickle.dump(regulons, f)
+
+	print("Finding AUC of cells")
+	auc_mtx = aucell(ex_matrix, regulons, num_workers=1)
+	auc_file = os.path.join(RESULT_FOLDER, "AUC_" + inputFilename + ".csv")
+	auc_mtx.to_csv(auc_file)
+
+	# Write to JSON for import to R
+	rdict = {} 
+	for reg in regulons:
+		targets = [ target for target in reg.gene2weight ]
+		rdict[reg.name] = targets
+
+
+	rjson = json.dumps(rdict)
+	jsonFile = os.path.join(RESULT_FOLDER, "regulons_" + inputFilename + ".json")
+	f = open(jsonFile,"w")
+	f.write(rjson)
+	f.close()
+
+	# Plot the results for visualization
+	#sns_plot = sns.clustermap(auc_mtx, figsize=(8,8))
+	#plotFile = os.path.join(RESULT_FOLDER, "AUC_" + inputFilename + ".png")
+	#sns_plot.savefig(plotFile)
+
+```
+
+
+## Processing SCENIC data
+Next, we will return to R to analyze regulon activity levels with Seurat. This step include basic processing including scaling regulon activities and dimensionality reduction with PCA and UMAP. It will also save the regulon activities in .Rds format for future work in R.
+```{r 3_proc_scenic_data, eval=FALSE}
+## 3 - processing pySCENIC results: this script reads as input the results from pySCENIC and puts them into R-friendly data formats for downstream analysis. 
+## It also conducts some basic data processing: regulon activity is scaled and highly variable TFs are identified
+## Finally, it performs dimensionality reduction via PCA and UMAP
+
+rm(list = ls()) # clean workspace
+library(Seurat)
+
+options(stringsAsFactors = FALSE)
+## Network Construction
+treatments <- c("EGF","TGFB1", "TNF")
+cancer_types <- c("A549","DU145","MCF7","OVCA420")
+direction <- c("fwd", "rev")
+
+data_dir <- file.path(getwd(),"data")
+results_dir <- file.path(getwd(),"results")
+
+# Iterate through each condition
+for(tCounter in 1:length(treatments)){
+  t = treatments[tCounter]
+  for(c in 1:length(cancer_types)) {
+    
+    ## Read in seurat object and regulon data
+    ## We will use regulon activities here in place of counts and perform routine Seurat data processing
+    # First, process data from fwd direction 
+    seurat <- readRDS(file.path(data_dir,paste0(cancer_types[c],"_",t,".rds")))
+    auc_fname <- file.path(results_dir,paste0("AUC_",cancer_types[c],"_",t,"_fwd.csv"))
+    auc_matrix <- read.table(auc_fname, header=TRUE, sep = ",", row.names = 1, check.names = FALSE)
+    auc_matrix <- t(auc_matrix)
+    seuratFwd <- subset(seurat, Time %in% c("0d", "1d", "3d", "7d", "8h"))
+    auc_matrix <- auc_matrix[,colnames(seuratFwd)]
+    seurat_regs <- CreateSeuratObject(counts = auc_matrix)
+    seurat_regs <- AddMetaData(seurat_regs, metadata = FetchData(seurat, "Time"))
+    Idents(seurat_regs) <- "Time"
+    allGenes <- rownames(seurat_regs)
+    
+    # Scale data, find highly variable genes
+    seurat_regs <- ScaleData(seurat_regs, features = allGenes)
+    seurat_regs <- FindVariableFeatures(seurat_regs)
+    
+    # Dimensionality reduction w/ PCA and UMAP
+    seurat_regs <- RunPCA(seurat_regs)
+    seurat_regs <- RunUMAP(seurat_regs, dims = 1:50)
+   
+    # Save Rds files
+    saveRDS(seurat_regs, file = file.path(results_dir,paste0("seurat_regs",cancer_types[c],"_",t,"_fwd.Rds")))
+    
+    ## Next, process the rev direction the same way
+    auc_fname <- file.path(results_dir,paste0("AUC_",cancer_types[c],"_",t,"_rev.CSV"))
+    auc_matrix <- read.table(auc_fname, header=TRUE, sep = ",", row.names = 1, check.names = FALSE)
+    auc_matrix <- t(auc_matrix)
+    seuratRev <- subset(seurat, Time %in% c("1d_rm","3d_rm",  "7d", "8h_rm" ))
+    auc_matrix <- auc_matrix[,colnames(seuratRev)]
+    
+    seurat_regs <- CreateSeuratObject(counts = auc_matrix)
+    seurat_regs <- AddMetaData(seurat_regs, metadata = FetchData(seurat, "Time"))
+    Idents(seurat_regs) <- "Time"
+    allGenes <- rownames(seurat_regs)
+    
+    seurat_regs <- ScaleData(seurat_regs, features = allGenes)
+    seurat_regs <- FindVariableFeatures(seurat_regs)
+    
+    seurat_regs <- RunPCA(seurat_regs)
+    seurat_regs <- RunUMAP(seurat_regs, dims = 1:50)
+    
+    
+    saveRDS(seurat_regs, file = file.path(results_dir,paste0("seurat_regs",cancer_types[c],"_",t,"_rev.Rds")))
+  }
+}
+
+```
+
+
+## Differential activity analysis
+```{r 4_DAA, eval=FALSE}
+## 4 - Differential activity analysis: this script will identify regulons with differential levels of activity between timepoints.
+## Specifically, it makes 7 comparisons for each of 12 conditions (84 total): 0d vs 8h, 1d, 3d, and 7d; and 7d vs 8h_rm, 1d_rm, 3d_rm
+
+rm(list = ls()) # clean workspace
+library(Seurat)
+
+options(stringsAsFactors = FALSE)
+
+# Global variables
+treatments <- c("EGF","TGFB1", "TNF")
+cancer_types <- c("A549","DU145","MCF7","OVCA420")
+direction <- c("fwd", "rev")
+results_dir <- file.path(getwd(),"results")
+
+# Compile a set of all DARs across all conditions
+# Note: since we placed the regulon activities in the "counts" slot, this analysis will yield differentially active regulons, 
+# not differentially expressed genes (DEGs). 
+degs <- data.frame()
+for(tCounter in seq_along(treatments)){
+  for(cCounter in seq_along(cancer_types)){
+    for(dCounter in seq_along(direction)){
+      
+      ## Select a treatment to work with (default is iterate thru all conditions in a loop)
+      t <- treatments[tCounter]
+      c <- cancer_types[cCounter]
+      direc <- direction[dCounter]
+      treatmentName <- paste0(c,"_",t,"_",direc)
+      print(treatmentName)
+      
+      seurat_regs <- readRDS(file.path(results_dir,paste0("seurat_regs",c,"_",t,"_",direc,".Rds")))
+      
+      # For fwd, identify DEGs between 0d and each later timepoint
+      if(direc == "fwd"){
+        for(degTime in c("8h", "1d", "3d", "7d")){
+          deg <- FindMarkers(seurat_regs, ident.1 = degTime, ident.2 = "0d", logfc.threshold = 0.0)
+          deg$CellLine <- c
+          deg$gene <- rownames(deg)
+          deg$Comparison <- paste0(c,"_",t,"_",direc)
+          deg$Time <-  degTime
+          degs <- rbind(degs,deg)
+        }
+      }
+      # For rev, identify DEGs between 7d and each subsequent timepoint after signal removal
+      if(direc == "rev"){
+        for(degTime in c("8h_rm", "1d_rm", "3d_rm")){
+          deg <- FindMarkers(seurat_regs, ident.1 = degTime, ident.2 = "7d", logfc.threshold = 0.0)
+          deg$CellLine <- c
+          deg$gene <- rownames(deg)
+          deg$Comparison <- paste0(c,"_",t,"_",direc)
+          deg$Time <-  degTime
+          degs <- rbind(degs,deg)
+        }
+      }
+    }
+  }
+}
+
+# Save compiled results to Rds file
+saveRDS(degs, file = file.path(results_dir,"degRegsFwd0dRev7d.rds"))
+
+```
+
+
+## Identifying differentially active TFs (DATFs)
+```{r 5_datf, eval=FALSE}
+## 5 - Identifying differentially active TFs across several experimental conditions
+
+rm(list = ls()) # clean workspace
+library(Seurat)
+library(jsonlite)
+library(sjmisc)
+library(stringr)
+library(MASS)
+library(UpSetR)
+library(ggplot2)
+library(dplyr)
+
+options(stringsAsFactors = FALSE)
+
+## Global variables
+treatments <- c("EGF","TGFB1", "TNF")
+cancer_types <- c("A549","DU145","MCF7","OVCA420")
+direction <- c("fwd", "rev")
+results_dir <- file.path(getwd(),"results")
+
+# Make a list of all conditions
+counter <- 1
+treatmentNames <- c()
+for(tCounter in seq_along(treatments)){
+  for(cCounter in seq_along(cancer_types)){
+    t <- treatments[tCounter]
+    c <- cancer_types[cCounter]
+    treatmentNames <- c(treatmentNames,paste0(c,"_",t))
+    
+  }
+}
+
+# Read in complete set of DEGs
+degs <- readRDS(file = file.path(results_dir, "degRegsFwd0dRev7d.rds"))
+degs$Signal <- str_match(degs$Comparison, "_(.*?)_")[,2]
+
+# Loop through all conditions 
+diffRegulonList <- list()
+nDiffRegulon <- 100
+set.seed(123)
+for(tCounter in seq_along(treatments)){
+  for(cCounter in seq_along(cancer_types)){
+    for(dCounter in seq_along(direction)){
+      t <- treatments[tCounter]
+      c <- cancer_types[cCounter]
+      direc <- direction[dCounter]
+      treatmentName <- paste0(c,"_",t,"_",direc)
+      print(treatmentName)
+      
+      # Identify DEGs from this condition 
+      deg_reg <- degs[degs$Comparison == paste0(c,"_",t,"_",direc),] 
+      seurat_regs <- readRDS(file.path(results_dir, paste0("seurat_regs",c,"_",t,"_",direc,".Rds")))
+      
+      # Read regulons from SCENIC for this condition
+      regulon_fname <- file.path(results_dir,paste0("regulons_",c,"_",t,"_",direc,".json"))
+      regs <- read_json(regulon_fname, simplify = T)
+      
+      # Take the top N regulons (100 by default) by adjusted p-value
+      networkReg <- deg_reg$gene[rank(deg_reg$p_val_adj, ties.method = "random")]
+      networkReg <- unique(networkReg)
+      networkReg <- networkReg[1:min(nDiffRegulon,length(networkReg))]
+      regs <- regs[networkReg]
+      diffRegulonList[[treatmentName]]  <-  regs
+    }
+  }
+}
+saveRDS(diffRegulonList, file = file.path(results_dir, "diffRegulonTop100Deg0d7d.rds"))
+
+# Combine regulon sets for fwd and rev into one list for each condition
+diffRegulonNames <- lapply(diffRegulonList, function(x) names(x))
+diffRegulonFwdRev <- list()
+for(i in 1:(length(diffRegulonList)/2)){
+  diffRegulonFwdRev[[i]] <- union(diffRegulonNames[[2*i-1]],diffRegulonNames[[2*i]])
+}
+
+# Save combined regulon lists to file
+names(diffRegulonFwdRev) <- treatmentNames
+saveRDS(diffRegulonFwdRev, file = file.path(results_dir, "diffRegulonFwdRev.rds"))
+
+# Visualize overlap in differentially active regulons with upSet plots
+diffRegulonFwdRev = diffRegulonFwdRev[order(names(diffRegulonFwdRev))]
+upset(fromList(diffRegulonFwdRev),keep.order = F, group.by = "degree", text.scale = 2, nsets = length(diffRegulonFwdRev)) 
+
+# Histogram of how many comparisons each TF is differentially active across
+degs <- readRDS(file = file.path(results_dir, "degRegsFwd0dRev7d.rds"))
+degsFiltered <- degs[degs$p_val_adj < 0.05,]
+TfFrequency <- degsFiltered %>%
+  group_by(gene) %>%
+  summarize(n())
+hist(TfFrequency$`n()`, breaks = 20)
+
+# Select all DATFs which appear in at least 24/84 comparisons as the core network
+coreTf <- TfFrequency$gene[TfFrequency$`n()` > 23]
+saveRDS(coreTf, file = file.path(results_dir,"coreTf.rds"))
+
+```
+
+## Visualize regulatory activity with UMAP
+```{r 6_plot_activities, eval=FALSE}
+## 6 - plot activities: this script visualizes the regulon activity across conditions using UMAP
+# It will create a 12-page pdf with UMAP plots of regulatory activity for each condition
+# Each timepoint will be marked by a black circle, which increase in opacity and size as time progresses, and are connected by a dotted line.
+## Expected runtime: 
+
+
+### Setup
+rm(list = ls())
+library(Seurat)
+library(jsonlite)
+library(sjmisc)
+library(stringr)
+library(varhandle)
+library(plyr)
+library(ggplot2)
+library(ggpmisc)
+library(spatstat.utils)
+library(umap)
+library(ggthemes)
+library(RColorBrewer)
+
+# Install a forked version of the LSD package, for heatscatter plots compatible with ggplot
+dir.create(file.path(getwd(),"LSD_dir"))
+remotes::install_github("stineb/LSD", lib=file.path(getwd(),"LSD_dir"))
+library(LSD, lib.loc = file.path(getwd(),"LSD_dir"))
+
+
+## Initialize some values
+treatments <- c("EGF","TGFB1", "TNF")
+cancer_types <- c("A549","DU145","MCF7","OVCA420")
+directions <- c("fwd","rev")
+results_dir <- file.path(getwd(),"results")
+fig_dir <- file.path(getwd(),"figs")
+if(!dir.exists(fig_dir)) {
+  dir.create(fig_dir)
+}
+
+plotFName <- file.path(fig_dir,"UMAP_density_alpha.pdf")
+working_directory <- getwd()
+cbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#E84855")
+
+## Color setup for plots
+rf <- colorRampPalette(rev(brewer.pal(11,'Spectral')))
+plot_color <- rf(20)
+
+## Make plot list
+umap_density_list <- list()
+iter <- 1
+
+## Loop thru cell lines, treatments, directions
+for(cancer in seq_along(cancer_types)) {
+  c <- cancer_types[cancer]
+  for(treatment in seq_along(treatments)) {
+    t <- treatments[treatment]
+    shared_regs <- c()
+    print(paste0("Starting work on ",c,"_",t))
+    for(dir in seq_along(directions)) {
+      d <- directions[dir]
+      if(d == "fwd") {
+        seurat_regs_fwd <- readRDS(file.path(results_dir,paste0("seurat_regs",c,"_",t,"_",d,".Rds")))
+        auc_mtx_fwd <- as.data.frame(t(GetAssayData(seurat_regs_fwd, slot = "scale.data")))
+        auc_mtx_fwd$Time <- FetchData(seurat_regs_fwd, "Time")[,"Time"]
+        auc_mtx_fwd$Direction <- d
+        auc_mtx_fwd$Cell <- rownames(auc_mtx_fwd)
+        
+      } else {
+        seurat_regs_rev <- readRDS(file.path(results_dir,paste0("seurat_regs",c,"_",t,"_",d,".Rds")))
+        auc_mtx_rev <- as.data.frame(t(GetAssayData(seurat_regs_rev, slot = "scale.data")))
+        auc_mtx_rev$Time <- FetchData(seurat_regs_rev, "Time")[,"Time"]
+        auc_mtx_rev$Direction <- d
+        auc_mtx_rev$Cell <- rownames(auc_mtx_rev)
+        
+      }
+    }
+    
+    ## Scale using 7d data
+    shared_regs <- colnames(auc_mtx_fwd)[which(colnames(auc_mtx_fwd) %in% colnames(auc_mtx_rev))]
+    shared_regs_short <- shared_regs[-((length(shared_regs)-2):length(shared_regs))]
+    auc_mtx_fwd_scale <- auc_mtx_fwd[,shared_regs]
+    auc_mtx_rev_scale <- auc_mtx_rev[,shared_regs]
+    for(reg in shared_regs_short) {
+      fwd_7d_reg <- auc_mtx_fwd_scale[which(auc_mtx_fwd_scale$Direction == "fwd" & 
+                                              auc_mtx_fwd_scale$Time == "7d"),reg]
+      rev_7d_reg <- auc_mtx_rev_scale[which(auc_mtx_rev_scale$Direction == "rev"& 
+                                              auc_mtx_rev_scale$Time == "7d"),reg]
+      ## Generate linear models
+      x_lm <- lm(fwd_7d_reg ~ rev_7d_reg)
+      new_rev_reg <- (auc_mtx_rev_scale[which(auc_mtx_rev_scale$Direction == "rev" ),reg] * 
+                        unname(x_lm$coefficients["rev_7d_reg"])) + 
+        unname(x_lm$coefficients["(Intercept)"])
+      
+      ## Replace reverse data
+      auc_mtx_rev_scale[,reg] <- new_rev_reg
+      
+    }
+    
+    ## Combine fwd and rev data
+    auc_mtx_fwd_scale <- auc_mtx_fwd_scale[which(!auc_mtx_fwd_scale$Time == "7d"),]
+    combined_mtx <- rbind(auc_mtx_fwd_scale, auc_mtx_rev_scale)
+    na_regs <- colnames(combined_mtx[,colSums(is.na(combined_mtx)) != 0])
+    combined_mtx_noNA <- combined_mtx[ , colSums(is.na(combined_mtx)) == 0]
+    pca_regs <- shared_regs_short[which(shared_regs_short %in% colnames(combined_mtx_noNA))]
+    combined_cellInfo <- combined_mtx[,c("Time","Direction",'Cell')]
+    
+    ## Progress report
+    print(paste0("Finished scaling data for ",c,"_",t,". Starting dimensional reduction."))
+    
+    ## Run UMAP
+    umap_rs <- umap(combined_mtx_noNA[,pca_regs])
+    umap_data <- as.data.frame(umap_rs$layout)
+    colnames(umap_data) <- c("x","y")
+    if(all.equal(combined_cellInfo$Cell, rownames(umap_data))) {
+      umap_data$Time <- combined_cellInfo$Time
+    }
+    umap_data$Time <- factor(umap_data$Time, levels = c("0d", "8h", "1d", "3d", "7d", "8h_rm", "1d_rm", "3d_rm"))
+    
+    ## Progress report
+    print(paste0("Done with dimensional reductions for ",c,"_",t,". Creating plots now."))
+    
+    ## Calculate centroids for each timepoint
+    centroid_df_umap <- aggregate(umap_data[,c("x","y")], list(Time=umap_data$Time), mean)
+    
+    ## Plot UMAP density with timepoint data
+    ggscatter <- heatscatter(umap_data[,1], umap_data[,2], 
+                             xlab = "UMAP1", 
+                             ylab= "UMAP2", 
+                             ggplot = TRUE)
+    image <- ggscatter + 
+      geom_point(data=centroid_df_umap, mapping = aes(x=x, y=y, size=Time, alpha=Time)) +
+      geom_path(data = centroid_df_umap, arrow = arrow(), linetype="dashed") +
+      guides(alpha=FALSE, size=FALSE, color=FALSE, shape=FALSE) +
+      scale_shape_manual(values = c(15,16,17,18,8,21,24,23)) +
+      scale_alpha_discrete(breaks=c(0.4,0.485,0.57,0.655,0.74,0.825,0.91,1)) +
+      ggtitle(paste(c," ",t)) +
+      theme(title = element_text(size=20),
+            axis.title = element_text(size = 20),
+            axis.text = element_text(size=18),
+            plot.subtitle = element_text(size=16),
+            legend.title = element_text(size=20),
+            legend.title.align = 0,
+            legend.text = element_text(size=18),
+            legend.key.size = unit(20, units = "pt")) +
+      labs(subtitle = paste0("UMAP on ",length(pca_regs), " regulons in ", nrow(umap_data), " cells"))
+    if(t == "TNF") {
+      image <- image + 
+        guides(size=guide_legend(title = "Time"), 
+               color=guide_legend(override.aes = list(size = 3.5)), 
+               shape=guide_legend(override.aes = list(size = 3.5)))
+    }
+    umap_density_list[[iter]] <- image
+    
+    
+    ## Increase iterator
+    iter <- iter+1
+  }
+}
+
+## Save all plots
+pdf(file = plotFName, width=11.5, height=8)
+for(plot in umap_density_list) {
+  print(plot, newpage = TRUE)
+}
+graphics.off()
+
+
+```
+
+
+## Plot activity over time of 28 highly conserved regulons
+```{r 7_activity_boxplots, eval=FALSE}
+### Setup
+rm(list = ls())
+library(Seurat)
+library(jsonlite)
+library(sjmisc)
+library(stringr)
+library(varhandle)
+library(plyr)
+library(ggplot2)
+library(ggpmisc)
+#library(rowr)
+library(spatstat.utils)
+library(umap)
+library(ggthemes)
+
+## ggplot theme for graphics
+ggtheme <- function (base_size = 11, base_family = "") {
+  theme_get() %+replace%
+    theme(axis.title = element_text(size = 16),
+          axis.text = element_text(size=14),
+          axis.line = element_line(color = "black", linetype = "solid"),
+          title = element_text(size = 16),
+          legend.title = element_text(size=16),
+          legend.title.align = 0,
+          legend.text = element_text(size=14),
+          legend.key.size = unit(20, units = "pt"),
+          panel.grid = element_blank(),
+          panel.background = element_blank())
+}
+
+# Multiple plot function from http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+## Initialize some values
+treatments <- c("EGF","TGFB1", "TNF")
+cancer_types <- c("A549","DU145","MCF7","OVCA420")
+directions <- c("fwd","rev")
+cbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#E84855")
+fig_dir <- file.path(getwd(),"figs")
+results_dir <- file.path(getwd(),"results")
+
+
+## Get reg list
+reg_list <- c("BHLHE40(+)", "CEBPB(+)", "CREB3(+)", "CREM(+)", "ELK3(+)",
+              'ESRRA(+)', 'ETS1(+)', 'ETS2(+)', 'FOS(+)', 'FOSB(+)',
+              'FOSL1(+)', 'IRF1(+)', 'IRF2(+)', 'IRF3(+)', 'IRF7(+)', 
+              'JUN(+)', 'JUNB(+)', 'KLF6(+)', 'MAFG(+)', 'MYC(+)', 
+              'NFE2L3(+)', 'NFKB2(+)', 'RELB(+)', 'SOX4(+)', 'SPDEF(+)',
+              'STAT1(+)', 'STAT3(+)', 'XBP1(+)')
+gene_list <- reg_list
+
+## make dummy plot for null cases
+dummy_df <- data.frame(x=1,y=1)
+dummy_plot <- ggplot(data = dummy_df) +
+  geom_point(aes(x=x, y=y, alpha=0.0001)) +
+  guides(alpha=FALSE) +
+  ggtheme() +
+  geom_text(mapping = aes(x=1, y=1, label="NULL"))
+
+for(g in seq_along(gene_list)) {
+  gene_plotlist <- list()
+  iter <- 1
+  for(c in cancer_types) {
+    for(t in treatments) {
+      gene_df_full <- data.frame(Activity=numeric(), Time=character(),Direction=character())
+      for(d in directions) {
+        ## Read auc matrix, seurat object, de regs
+        treatmentName <- paste0(c,"_",t,"_",d)
+        seurat_regs <- readRDS(file.path(results_dir,paste0("seurat_regs",c,"_",t,"_",d,".Rds")))
+        auc_mtx <- GetAssayData(seurat_regs, slot = "scale.data")
+        
+        ## Select gene of interest
+        if(gene_list[g] %in% rownames(auc_mtx)) {
+          gene_df <- as.data.frame(auc_mtx[gene_list[g],])
+          colnames(gene_df)[1] <- "Activity"
+          gene_df$Time <- FetchData(seurat_regs, "Time")[,"Time"]
+          gene_df$Direction <- d
+          gene_df_full <- rbind(gene_df_full, gene_df)
+        }
+      }
+      ## Only proceed if there is data for the regulon - also correct color scheme if data for one direction is missing
+      if(nrow(gene_df_full) > 0) {        
+        gene_df_full$Time <- factor(gene_df_full$Time, levels = c("0d", "8h", "1d", "3d", "7d", "8h_rm", "1d_rm", "3d_rm"))
+        
+        if(length(unique(gene_df_full$Direction)) == 1) {
+          if(unique(gene_df_full$Direction) == "fwd") {
+            plotColors <- cbPalette
+          } else {
+            plotColors <- cbPalette[5:8]
+          }
+        } else {
+          plotColors <- cbPalette
+        }
+        
+        ## Plot
+        image <- ggplot(gene_df_full, aes(x=Time,y=Activity, fill=Time)) +
+          geom_boxplot() +
+          ggtheme() +
+          ylab(paste0(gene_list[g])) +
+          scale_fill_manual(values=plotColors) +
+          guides(fill=FALSE) +
+          facet_wrap(~Direction, scales = "free") +
+          theme(axis.text.y = element_text(size = 14), 
+                title = element_text(size = 20), 
+                axis.title.y = element_text(size = 16),
+                legend.text = element_text(size = 12),
+                legend.title = element_text(size = 14),
+                strip.text = element_text(size = 16),
+                axis.text.x = element_blank(),
+                axis.title.x = element_blank()) +
+          ggtitle(paste0(c," ", t))
+        
+        if(t == "TNF") {
+          image <- image +
+            theme(axis.text.x = element_text(size = 16, angle = 90), 
+                  axis.title.x = element_text(size=20))
+        }
+        gene_plotlist[[iter]] <- image
+        iter <- iter+1
+      } 
+      else {
+        gene_plotlist[[iter]] <- dummy_plot
+        iter <- iter+1
+        
+      }
+    }
+  }
+  
+  ## Save plot for this regulon
+  title <- file.path(fig_dir,paste0(gene_list[g],"_time_activity.pdf"))
+  pdf(file = title, width = 22, height = 17)
+  multiplot(plotlist = gene_plotlist, cols = 4)
+  dev.off()
+  
+}
+
+```
+
+
+## Plot EMT TF activity during transition
+
+Using three specific combinations of regulons known to be highly involved in the propagation of the EMT-inducing signals, specifically 1) RELB+NFKB2 vs FOSL1+JUNB, 2) FOSL1 vs RELB, and 3) JUNB vs RELB, we then visualized the average activity of these TFs over time for each condition. As in the earlier UMAP density plots, the regulon activity data were scaled on a linear model such that the
+```{r 8_emtTFs_activity, eval=FALSE}
+### Setup
+rm(list = ls())
+library(Seurat)
+library(jsonlite)
+library(sjmisc)
+library(stringr)
+library(varhandle)
+library(plyr)
+library(ggplot2)
+library(ggpmisc)
+#library(rowr)
+library(spatstat.utils)
+library(umap)
+library(ggthemes)
+library(RColorBrewer)
+
+## ggplot theme for graphics
+ggtheme <- function (base_size = 11, base_family = "") {
+  theme_get() %+replace%
+    theme(axis.title = element_text(size = 18),
+          axis.text = element_text(size=16),
+          axis.line = element_line(color = "black", linetype = "solid"),
+          title = element_text(size = 20),
+          legend.title = element_text(size=18),
+          legend.title.align = 0,
+          legend.text = element_text(size=16),
+          legend.key.size = unit(20, units = "pt"),
+          panel.grid = element_blank(),
+          panel.background = element_blank())
+}
+
+# Multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+
+## Initialize some values
+treatments <- c("EGF","TGFB1", "TNF")
+cancer_types <- c("A549","DU145","MCF7","OVCA420")
+directions <- c("fwd","rev")
+results_dir <- file.path(getwd(),"results")
+fig_dir <- file.path(getwd(),"figs")
+cbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#E84855")
+
+## Parameters
+genepair_lists <- list(c("RELB+NFKB2","FOSL1+JUNB"),c("FOSL1","RELB"),c("JUNB","RELB"))
+
+## make dummy plot for null cases
+dummy_df <- data.frame(x=1,y=1)
+dummy_plot <- ggplot(data = dummy_df) +
+  geom_point(aes(x=x, y=y, alpha=0.0001)) +
+  guides(alpha=FALSE) +
+  ggtheme() +
+  geom_text(mapping = aes(x=1, y=1, label="NULL"))
+
+for(genes in genepair_lists) {
+  trans_centroid_plotlist <- list()
+  iter <- 1
+  
+  g1_expanded <- strsplit(genes[1],"\\+")[[1]]
+  g2_expanded <- strsplit(genes[2],"\\+")[[1]]
+  full_genelist <- c(g1_expanded, g2_expanded)
+  
+  regs_g1 <-paste0(g1_expanded, "(+)") 
+  regs_g2 <-paste0(g2_expanded, "(+)") 
+  regs <- paste0(full_genelist, "(+)")
+  
+  ## Loop thru cancer types and treatments (12 conditions)
+  for(c in cancer_types) {
+    for(t in treatments) {
+      activity_df_full <- data.frame(x=numeric(),y=numeric(),Time=character(),Direction=character())
+      # Combine data for fwd and rev
+      for(d in directions) {
+        seurat_regs <- readRDS(file.path(results_dir,paste0("seurat_regs",c,"_",t,"_",d,".Rds")))
+        if(length(regs[which(regs %in% rownames(seurat_regs))]) == length(regs)) {
+          auc_mtx <- as.data.frame(t(GetAssayData(seurat_regs, slot = "scale.data")[regs,]))
+          if(length(regs) == 2) {
+            colnames(auc_mtx) <- c("x","y")
+            auc_mtx$Time <- FetchData(seurat_regs, "Time")[,"Time"]
+            auc_mtx$Direction <- d
+          } 
+          else if(length(regs) == 4){
+            auc_mtx$x <- rowSums(auc_mtx[,c(regs_g1)], dims = 1)
+            auc_mtx$y <- rowSums(auc_mtx[,c(regs_g2)], dims = 1)
+            auc_mtx <- auc_mtx[,c("x","y")]
+            auc_mtx$Time <- FetchData(seurat_regs, "Time")[,"Time"]
+            auc_mtx$Direction <- d
+          } 
+          else {
+            auc_mtx <- data.frame()
+          }
+          
+        } else if(c == "MCF7" & t == "EGF") {
+          ## Handle an exception case where data is missing for one regulon
+          auc_mtx <- as.data.frame(t(GetAssayData(seurat_regs, slot = "scale.data")[c("RELB(+)",regs_g2),]))
+          auc_mtx$x <- auc_mtx$`RELB(+)`
+          auc_mtx$y <- rowSums(auc_mtx[,c(regs_g2)], dims = 1)
+          auc_mtx <- auc_mtx[,c("x","y")]
+          auc_mtx$Time <- FetchData(seurat_regs, "Time")[,"Time"]
+          auc_mtx$Direction <- d
+        }
+        else {
+          auc_mtx <- data.frame()
+        }
+        activity_df_full <- rbind(activity_df_full, auc_mtx)
+        
+      }
+      ## If data for both directions is present, scale rev data to match fwd
+      if(nrow(activity_df_full) > 0 & length(unique(activity_df_full$Direction)) == 2) {  
+        ## Set colors 
+        activity_df_full$Time <- factor(activity_df_full$Time, 
+                                        levels = c("0d", "8h", "1d", "3d", "7d", "8h_rm", "1d_rm", "3d_rm"))
+        plotColors <- cbPalette
+        
+        #### Scaled plots
+        if(length(unique(activity_df_full$Direction)) == 2) {
+          fwd_7d_x <- activity_df_full[which(activity_df_full$Direction == "fwd" & activity_df_full$Time == "7d"),"x"]
+          fwd_7d_y <- activity_df_full[which(activity_df_full$Direction == "fwd"& activity_df_full$Time == "7d"),"y"]
+          
+          rev_7d_x <- activity_df_full[which(activity_df_full$Direction == "rev"& activity_df_full$Time == "7d"),"x"]
+          rev_7d_y <- activity_df_full[which(activity_df_full$Direction == "rev"& activity_df_full$Time == "7d"),"y"]
+          
+          ## Generate linear models
+          x_lm <- lm(fwd_7d_x ~ rev_7d_x)
+          y_lm <- lm(fwd_7d_y ~ rev_7d_y)
+          
+          ## Rescale rev data
+          new_rev_x <- (activity_df_full[which(activity_df_full$Direction == "rev" ),"x"] * 
+                          unname(x_lm$coefficients["rev_7d_x"])) + 
+            unname(x_lm$coefficients["(Intercept)"])
+          new_rev_y <- (activity_df_full[which(activity_df_full$Direction == "rev" ),"y"] * 
+                          unname(y_lm$coefficients["rev_7d_y"])) + 
+            unname(y_lm$coefficients["(Intercept)"])
+          
+          ## Add to df
+          activity_df_full$transformed_x <- activity_df_full$x
+          activity_df_full[which(activity_df_full$Direction == "rev"),"transformed_x"] <- new_rev_x
+          
+          activity_df_full$transformed_y <- activity_df_full$y
+          activity_df_full[which(activity_df_full$Direction == "rev"),"transformed_y"] <- new_rev_y
+        }
+        
+        ## Make centroid df
+        centroid_df <- aggregate(activity_df_full[,c("transformed_x","transformed_y")], 
+                                 list(Time=activity_df_full$Time), mean)
+        
+        ## Plot centroids
+        rf <- colorRampPalette(rev(brewer.pal(11,'Spectral')))
+        plot_color <- rf(20)
+        image <- ggplot(centroid_df, aes(x=transformed_x,y=transformed_y)) +
+          geom_point(mapping=aes(size=1,  color=Time)) +
+          geom_path(aes(alpha=0.5), arrow = arrow(), linetype="dashed") +
+          xlab(genes[1]) +
+          ylab(genes[2]) +
+          scale_size(range=c(1.75, 3)) +
+          scale_shape_manual(values=c(16,17,3,4,8,18,15,13)) +
+          guides(alpha=FALSE, size=FALSE, color=FALSE) + 
+          scale_color_manual(values=plot_color) +
+          ggtheme() +
+          ggtitle(paste(c," ",t))
+        trans_centroid_plotlist[[iter]] <- image
+        iter <- iter+1
+        
+        
+      } 
+      else {
+        trans_centroid_plotlist[[iter]] <- dummy_plot
+        iter <- iter+1
+      }
+    }
+  }
+  
+  title <- file.path(fig_dir,paste0(genes[1],"_",genes[2],"_activity_centroids_SCALED.pdf"))
+  pdf(file = title, width = 22, height = 17)
+  multiplot(plotlist = trans_centroid_plotlist, cols = 4)
+  dev.off()
+}
+```
+
+
+## Network construction
+We used the DATF regulons to identify Tf-target pairs for all the experimental conditions. Below, we generate 24 networks comprising all interactions within the highly conserved DATFs identified previously.
+```{r 9_network_construction, eval=FALSE}
+rm(list=ls())
+treatments <- c("EGF","TGFB1", "TNF")
+cancer_types <- c("A549","DU145","MCF7","OVCA420")
+directions <- c("fwd","rev")
+results_dir <- file.path(getwd(),"results")
+networks_dir <- file.path(results_dir,"network_construction")
+
+allRegulons <- list()
+for(tCounter in seq_along(treatments)){
+  for(cCounter in seq_along(cancer_types)){
+    for(dCounter in seq_along(directions)){
+      
+      ## Select a treatment to work with (or iterate thru t in a loop)
+      t <- treatments[tCounter]
+      c <- cancer_types[cCounter]
+      direc <- directions[dCounter]
+      treatmentName <- paste0(c,"_",t,"_",direc)
+      
+      
+      regulon_fname <- file.path(results_dir,paste0("regulons_",c,"_",t,"_",direc,".json"))
+      regs <- read_json(regulon_fname, simplify = T)
+      network <- data.frame(Source = character(), Target = character())
+      for(src in seq_along(regs)){
+        targets <- unlist(regs[src])
+        networkTmp <- data.frame(Source = rep(names(regs)[src],length(targets)), Target = targets)
+        network <- rbind(network, networkTmp)
+      }
+      network$Dataset <- treatmentName
+      allRegulons[[treatmentName]] <- network
+      
+    }
+  }
+}
+
+saveRDS(allRegulons, file = file.path(results_dir,"allRegulons.rds"))
+
+
+
+library(infotheo)
+#' @param data expression matrix. Genes in rows and samples/cells in columns
+#' @param nbins number of bins
+#' @value A mutual information matrix
+calculateMI <- function(data = actMat){
+  nGenes <- dim(data)[2]
+  miMat <- matrix(0,nrow = nGenes,ncol = nGenes)
+  geneNames <- colnames(data)
+  rownames(miMat) <- geneNames
+  colnames(miMat) <- geneNames
+  data <- infotheo::discretize(data)
+  #i=1
+  for(i in 1:(nGenes-1))
+  {
+    for(j in (i+1):(nGenes))
+    {
+      gene1 <- geneNames[i]
+      gene2 <- geneNames[j]
+      miMat[gene1, gene2] <- infotheo::mutinformation(data[,gene1], data[,gene2], method = "mm")
+      miMat[gene2, gene1] <- miMat[gene1, gene2]
+    }
+  }
+  return(miMat)
+}
+
+allRegulons <- readRDS(file.path(results_dir,"allRegulons.rds"))
+coreTf <- readRDS(file.path(results_dir,"coreTf.rds"))
+fullNetworkList <- list()
+counter <- 1
+for(tCounter in seq_along(treatments)){
+  for(cCounter in seq_along(cancer_types)){
+    for(dCounter in seq_along(directions)){
+      t <- treatments[tCounter]
+      c <- cancer_types[cCounter]
+      direc <- directions[dCounter]
+      treatmentName <- paste0(c,"_",t,"_",direc)
+      print(treatmentName)
+      tfInNetwork <- coreTf
+      tfInNetwork <- substr(tfInNetwork, 0, nchar(as.character(tfInNetwork)) -3)
+      geneNetwork <- data.frame(allRegulons[treatmentName])
+      colnames(geneNetwork) <- c("Source", "Target", "Dataset")
+      geneNetwork$Source <- substr(geneNetwork$Source, 0, nchar(as.character(geneNetwork$Source)) -3)
+      
+      # Include any interactions where TFs from core network are source or targets
+      coreInteractions <- geneNetwork[which(geneNetwork$Source %in% tfInNetwork),]
+      coreInteractionsTmp <- geneNetwork[which(geneNetwork$Target %in% tfInNetwork),]
+      
+      coreInteractions <- rbind(coreInteractions, coreInteractionsTmp)
+      colnames(coreInteractions) <- c("Source", "Target", "Dataset")
+      
+      coreInteractions <- coreInteractions[!duplicated(coreInteractions),]
+      
+      seurat_regs <- readRDS(file.path(results_dir,paste0("seurat_regs",c,"_",t,"_",direc,".Rds")))
+      networkGenes <- union(coreInteractions$Source, coreInteractions$Target)
+      tmp <- seurat_regs@assays$RNA@scale.data
+      regNames <- substr(rownames(tmp), 0, nchar(as.character(rownames(tmp))) -3)
+      networkGenes <- networkGenes[which(networkGenes %in% regNames)]
+      coreInteractions <- coreInteractions[which(coreInteractions$Source %in% networkGenes),]
+      coreInteractions <- coreInteractions[which(coreInteractions$Target %in% networkGenes),]
+      networkGenes <- union(coreInteractions$Source, coreInteractions$Target)
+      rownames(tmp) <- regNames
+      tmp <- tmp[which(rownames(tmp) %in% networkGenes),]
+      tmp <- t(tmp)
+      actMi <- calculateMI(tmp)
+      
+      mi <- integer(length = length(coreInteractions$Source))
+      for(int in seq_along(coreInteractions$Source)){
+        mi[int] <- actMi[as.character(coreInteractions$Source[int]), as.character(coreInteractions$Target[int])]
+      }
+      coreInteractions$Mi <- mi
+      
+      actCor <- cor(tmp, method = "s")
+      type <- integer(length = length(coreInteractions$Source))
+      for(int in seq_along(coreInteractions$Source)){
+        type[int] <- actCor[as.character(coreInteractions$Source[int]), as.character(coreInteractions$Target[int])]
+      }
+      coreInteractions$Cor <- type
+      type[type>0] <- 1
+      type[type<=0] <- 2
+      coreInteractions$Type <- type
+      coreInteractions$Dataset <- treatmentName
+      #  }
+      fullNetworkList[[treatmentName]] <- coreInteractions
+      counter <- counter+1
+    }
+  }
+}
+saveRDS(fullNetworkList, file = file.path(networks_dir,"fullNetworkList_top23RegAllRegAllInt.rds"))
+
+srcGenes <- lapply(fullNetworkList, function(x)x$Source)
+tgtGenes <- lapply(fullNetworkList, function(x)x$Target)
+dataset <- lapply(fullNetworkList, function(x)x$Dataset)
+types <- lapply(fullNetworkList, function(x)x$Type)
+actCor <- lapply(fullNetworkList, function(x)x$Cor)
+mi <- lapply(fullNetworkList, function(x)x$Mi)
+cellLine <- str_match(unlist(dataset), "(.*?)_")[,2]
+signal <- str_match(unlist(dataset), "_(.*?)_")[,2]
+
+allNetworkFull <- data.frame(Source = unlist(srcGenes), Target = unlist(tgtGenes), Type = unlist(types), Dataset = unlist(dataset), Cor = unlist(actCor), Mi = unlist(mi), CellLine = cellLine,Signal = signal, stringsAsFactors = FALSE)
+saveRDS(allNetworkFull, file.path(networks_dir,"allNetworkFullCoreMiTop23AllRegAllInt.rds"))
+     
+```
+
+## Network simulations
+```{r 10_network_simulation, eval=FALSE}
+rm(list=ls())
+
+library(sRACIPE)
+library(stringr)
+
+results_dir <- file.path(getwd(),"results")
+networks_dir <- file.path(results_dir,"network_construction")
+sim_dir <- file.path(results_dir,"simulations")
+
+# First, we define a function to filter interactions based on MI cutoffs and simulate network
+createNetworkMiValue <- function(tmpNetwork=tmpNetwork,posMi = posMi,
+                                 negMi = negMi, name = "A549", simulate = FALSE,
+                                 sim_dir = NA){
+  if(is.na(sim_dir)) {
+    sim_dir <- file.path(getwd(),"results","simulations")
+    if(!dir.exists(sim_dir)) {
+      dir.create(sim_dir)
+    }
+  }
+  tmpNetwork <- tmpNetwork[order(tmpNetwork$Mi, decreasing = TRUE),]
+  tmpNetwork <- tmpNetwork[!duplicated(tmpNetwork[c("Source","Target","Type")]),]
+  posNetwork <- tmpNetwork[tmpNetwork$Cor >0,]
+  posNetwork <- posNetwork[which(posNetwork$Mi > posMi),]
+  negNetwork <- tmpNetwork[tmpNetwork$Cor < 0,]
+  negNetwork <- negNetwork[which(negNetwork$Mi > negMi),]
+  if(dim(posNetwork)[1] == 0 | dim(negNetwork)[1] == 0) return()
+  
+  tmpNetwork <- rbind(posNetwork,negNetwork)
+  sum(duplicated(tmpNetwork[,c("Source","Target")]))
+  sum(duplicated(tmpNetwork[,c("Source","Target","Type")]))
+  tmpNetwork <- tmpNetwork[!duplicated(tmpNetwork[,c("Source","Target","Type")]),]
+  tmpNetwork[duplicated(tmpNetwork[,c("Source","Target")]),]
+  tmpNetwork[duplicated(tmpNetwork[,c("Source","Target")], fromLast = TRUE),]
+  delRows <- anyDuplicated(tmpNetwork[,c("Source","Target")])
+  delRows <- c(delRows, anyDuplicated(tmpNetwork[,c("Source","Target")], fromLast = TRUE))
+  delRows <- delRows[delRows>0]
+  if(length(delRows>0)){ tmpNetwork <- tmpNetwork[-delRows,]}
+  
+  interactionRemoved = length(tmpNetwork$Source)
+  # If signal nodes are to be removed iteratively, uncomment the next line
+  # while(interactionRemoved>0)
+  {
+    tmpVar = length(tmpNetwork$Source)
+    
+    tmpNetwork <- tmpNetwork[(which(tmpNetwork$Source %in% tmpNetwork$Target )),]
+    #     tmpNetwork <- tmpNetwork[which(tmpNetwork$Target %in% tmpNetwork$Source),]
+    interactionRemoved = tmpVar - length(tmpNetwork$Source)
+  }
+  
+  tmpNetwork <- tmpNetwork[!duplicated(tmpNetwork),]
+  message(length(tmpNetwork$Source))
+  networkTfs <- union(tmpNetwork$Source,tmpNetwork$Target)
+  coreTfGenes <- substr(coreTf,0,nchar(coreTf)-3)
+  print(networkTfs[which(networkTfs %in% coreTfGenes)])
+  
+  if(length(union(tmpNetwork$Source,tmpNetwork$Target)) <5) simulate = FALSE
+  #  if(length(which(tmpNetwork$Type ==2)) <2) simulate = FALSE
+  #  if(length(which(tmpNetwork$Type ==1)) <2) simulate = FALSE
+  
+  if(simulate){
+    tmp <- sracipeSimulate(circuit = tmpNetwork[,c("Source", "Target", "Type")], plotToFile = TRUE,
+                           numModels = 2000, plots = FALSE, stepper = "RK4", integrateStepSize = 0.02)
+    annotation(tmp) <- paste0(name,"_",as.character(posMi), "_",as.character(negMi),"Interactions")
+    # tmp <- sracipePlotData(tmp, plotToFile = T)
+    saveRDS(tmp, file = file.path(sim_dir,paste0(name,"_",as.character(posMi), "_",as.character(negMi),".rds")))
+  }
+  # return(tmpNetwork)
+}
+
+# Next we varied the positive and negative mutual information cutoffs to simulate a large number of networks.
+coreTf <- readRDS(file.path(results_dir,"coreTf.rds"))
+allNetworkFull <- readRDS(file.path(networks_dir,"allNetworkFullCoreMiTop23AllRegAllInt.rds"))
+
+for(posMi in seq(1,0.05,-0.05)){
+  for(negMi in seq(0.5,0.05,-0.05)){
+    cellLine = "DU145"
+    treatment <- "TNF"
+    print(paste0(cellLine,"_",treatment,"_",as.character(posMi),"_",as.character(negMi)))
+    tmpNetwork <- allNetworkFull[(allNetworkFull$CellLine == cellLine & allNetworkFull$Signal == treatment),]
+    
+    createNetworkMiValue(tmpNetwork,posMi=posMi,negMi = negMi,
+                         name=paste0(cellLine,"_",treatment), simulate = TRUE)
+  }
+}
+
+## Plot a sample network
+tmp <- readRDS(file.path(sim_dir,"DU145_TNF_0.4_0.1.rds"))
+tmp <- sracipePlotData(tmp)
+
+
+```
+
