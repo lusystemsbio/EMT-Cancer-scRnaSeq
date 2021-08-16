@@ -1,7 +1,7 @@
 # Prepare data for processing
 # First, install the needed packages from CRAN
-install.packages(c("stringr", "jsonlite", "sjmisc", "MASS", "UpSetR", "ggplot2", "googledrive","dplyr"))
-install.packages(c("varhandle", "plyr", "ggpmisc", "spatstat.utils", "umap", "ggthemes","RColorBrewer","infotheo")) # rowr?
+install.packages(c("stringr", "jsonlite", "sjmisc", "MASS", "UpSetR", "ggplot2", "googledrive","dplyr","Binarize"))
+install.packages(c("varhandle", "plyr", "ggpmisc", "spatstat.utils", "umap", "ggthemes","RColorBrewer","infotheo", "igraph")) # rowr?
 
 install.packages("BiocManager")
 BiocManager::install("Seurat")

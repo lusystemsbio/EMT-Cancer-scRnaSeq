@@ -9,7 +9,7 @@
 <meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
 
 
-<meta name="author" content="Dan Ramirez" />
+<meta name="author" content="Daniel Ramirez, Vivek Kohar, Mingyang Lu" />
 
 
 <title>EMT Cancer 2021 Workflow</title>
@@ -189,7 +189,7 @@ summary {
 
 
 <h1 class="title toc-ignore">EMT Cancer 2021 Workflow</h1>
-<h4 class="author">Dan Ramirez</h4>
+<h4 class="author">Daniel Ramirez, Vivek Kohar, Mingyang Lu</h4>
 <h4 class="date">8/13/2021</h4>
 
 </div>
@@ -210,7 +210,7 @@ pip3 install pyscenic==0.11.0</code></pre>
 <pre class="r"><code># Prepare data for processing
 # First, install the needed packages from CRAN
 install.packages(c(&quot;stringr&quot;, &quot;jsonlite&quot;, &quot;sjmisc&quot;, &quot;MASS&quot;, &quot;UpSetR&quot;, &quot;ggplot2&quot;, &quot;googledrive&quot;,&quot;dplyr&quot;))
-install.packages(c(&quot;varhandle&quot;, &quot;plyr&quot;, &quot;ggpmisc&quot;, &quot;spatstat.utils&quot;, &quot;umap&quot;, &quot;ggthemes&quot;,&quot;RColorBrewer&quot;)) # rowr?
+install.packages(c(&quot;varhandle&quot;, &quot;plyr&quot;, &quot;ggpmisc&quot;, &quot;spatstat.utils&quot;, &quot;umap&quot;, &quot;ggthemes&quot;,&quot;RColorBrewer&quot;,&quot;infotheo&quot;)) # rowr?
 
 install.packages(&quot;BiocManager&quot;)
 BiocManager::install(&quot;Seurat&quot;)
@@ -484,6 +484,7 @@ for(tCounter in 1:length(treatments)){
 </div>
 <div id="differential-activity-analysis" class="section level2">
 <h2>Differential activity analysis</h2>
+<p>Next, we identified the differentially activated transcription factors (DATFs) between 0d and other time points in the forward transition and 7 days and other time points in the reverse direction.</p>
 <pre class="r"><code>## 4 - Differential activity analysis: this script will identify regulons with differential levels of activity between timepoints.
 ## Specifically, it makes 7 comparisons for each of 12 conditions (84 total): 0d vs 8h, 1d, 3d, and 7d; and 7d vs 8h_rm, 1d_rm, 3d_rm
 
@@ -546,6 +547,7 @@ saveRDS(degs, file = file.path(results_dir,&quot;degRegsFwd0dRev7d.rds&quot;))</
 </div>
 <div id="identifying-differentially-active-tfs-datfs" class="section level2">
 <h2>Identifying differentially active TFs (DATFs)</h2>
+<p>Next, we looked at the overlap between the DATFs across various treatments. We used the top 100 DATFs from each comparison.</p>
 <pre class="r"><code>## 5 - Identifying differentially active TFs across several experimental conditions
 
 rm(list = ls()) # clean workspace
@@ -1355,6 +1357,7 @@ saveRDS(allNetworkFull, file.path(networks_dir,&quot;allNetworkFullCoreMiTop23Al
 </div>
 <div id="network-simulations" class="section level2">
 <h2>Network simulations</h2>
+<p>We applied various cutoffs to MI for activating and inhibiting interactions to create and simulate multiple candidate networks for each condition.</p>
 <pre class="r"><code>rm(list=ls())
 
 library(sRACIPE)
@@ -1443,6 +1446,454 @@ for(posMi in seq(1,0.05,-0.05)){
 ## Plot a sample network
 tmp &lt;- readRDS(file.path(sim_dir,&quot;DU145_TNF_0.4_0.1.rds&quot;))
 tmp &lt;- sracipePlotData(tmp)</code></pre>
+</div>
+<div id="datf-classifications" class="section level2">
+<h2>DATF classifications</h2>
+<p>Based on whether DATFs increased or decreased in activity during the fwd and rev transitions, we classified them as E or M markers.</p>
+<pre class="r"><code># 11 - Classify DATFs as E or M markers
+# DATFs are considered M markers if they have a positive fold change in the fwd transition and negative in the rev transition
+# E markers, conversely, should decrease in the fwd transition and subsequently increase in the rev transition
+rm(list=ls())
+library(igraph)
+library(stringr)
+
+options(stringsAsFactors = FALSE)
+results_dir &lt;- file.path(getwd(),&quot;results&quot;)
+networks_dir &lt;- file.path(results_dir,&quot;network_construction&quot;)
+sim_dir &lt;- file.path(results_dir,&quot;simulations&quot;)
+
+treatments &lt;- c(&quot;EGF&quot;,&quot;TGFB1&quot;, &quot;TNF&quot;)
+cancer_types &lt;- c(&quot;A549&quot;,&quot;DU145&quot;,&quot;MCF7&quot;,&quot;OVCA420&quot;)
+directions &lt;- c(&quot;fwd&quot;,&quot;rev&quot;)
+
+allNetworkFull &lt;- readRDS(file.path(networks_dir,&quot;allNetworkFullCoreMiTop23AllRegAllInt.rds&quot;))
+allGenes &lt;- union(allNetworkFull$Source,allNetworkFull$Target)
+degs &lt;- readRDS(file = file.path(results_dir,&quot;degRegsFwd0dRev7d.rds&quot;))
+degs$Signal &lt;- str_match(degs$Comparison, &quot;_(.*?)_&quot;)[,2]
+
+
+counter &lt;- 1
+treatmentNames &lt;- c()
+for(tCounter in seq_along(treatments)){
+  for(cCounter in seq_along(cancer_types)){
+    for(dCounter in seq_along(directions)){
+      t &lt;- treatments[tCounter]
+      c &lt;- cancer_types[cCounter]
+      direc &lt;- directions[dCounter]
+      treatmentNames &lt;- c(treatmentNames,paste0(c,&quot;_&quot;,t,&quot;_&quot;,direc))
+      
+    }
+  }
+}
+
+
+# Classify DATFs as E or M based on whether they increase/decrease in the fwd and rev transitions, with p-value &lt; 0.05
+EMClass &lt;- matrix(data = NA,ncol = length(treatmentNames),nrow = length(allGenes),dimnames = list(allGenes, treatmentNames))
+for(tCounter in seq_along(treatmentNames)){
+  degTmp &lt;- degs[which((degs$Comparison == treatmentNames[tCounter]) &amp; (degs$Time == &quot;7d&quot;) &amp; (degs$p_val_adj &lt; 0.05)),]
+  Mgenes &lt;- degTmp$gene[which(degTmp$avg_log2FC&gt;0)]
+  Mgenes &lt;- substr(Mgenes,0,nchar(Mgenes)-3)
+  Mgenes &lt;- Mgenes[which(Mgenes %in% allGenes)]
+  Egenes &lt;- degTmp$gene[which(degTmp$avg_log2FC&lt;0)]
+  Egenes &lt;- substr(Egenes,0,nchar(Egenes)-3)
+  Egenes &lt;- Egenes[which(Egenes %in% allGenes)]
+  EMClass[Egenes,treatmentNames[tCounter]] &lt;- FALSE
+  EMClass[Mgenes,treatmentNames[tCounter]] &lt;- TRUE
+  
+  degTmp &lt;- degs[which((degs$Comparison == treatmentNames[tCounter]) &amp; (degs$Time == &quot;3d_rm&quot;) &amp; (degs$p_val_adj &lt; 0.05)),]
+  Mgenes &lt;- degTmp$gene[which(degTmp$avg_log2FC&lt;0)]
+  Mgenes &lt;- substr(Mgenes,0,nchar(Mgenes)-3)
+  Mgenes &lt;- Mgenes[which(Mgenes %in% allGenes)]
+  Egenes &lt;- degTmp$gene[which(degTmp$avg_log2FC&gt;0)]
+  Egenes &lt;- substr(Egenes,0,nchar(Egenes)-3)
+  Egenes &lt;- Egenes[which(Egenes %in% allGenes)]
+  EMClass[Egenes,treatmentNames[tCounter]] &lt;- FALSE
+  EMClass[Mgenes,treatmentNames[tCounter]] &lt;- TRUE
+}
+saveRDS(EMClass, file = file.path(results_dir,&quot;EMClassP05.rds&quot;))
+
+
+counter &lt;- 1
+conditionNames &lt;- c()
+for(tCounter in seq_along(treatments)){
+  for(cCounter in seq_along(cancer_types)){
+    t &lt;- treatments[tCounter]
+    c &lt;- cancer_types[cCounter]
+    conditionNames &lt;- c(conditionNames,paste0(c,&quot;_&quot;,t))
+  }
+}
+
+## Unify DATF classifications across fwd and rev direction for each condition
+# If classifications disagree, leave DATFs as NA; if a classification is only present for one direction, use that for the overall condition
+EMClassCondition &lt;- matrix(data = NA,ncol = length(conditionNames),nrow = length(allGenes),dimnames = list(allGenes, conditionNames))
+for(tCounter in seq_along(conditionNames)){
+  for(geneCounter in seq_along(allGenes)){
+    if(is.na(EMClass[allGenes[geneCounter],2*tCounter-1])){
+      if(!is.na(EMClass[allGenes[geneCounter],2*tCounter])){
+        EMClassCondition[allGenes[geneCounter],conditionNames[tCounter]] &lt;- EMClass[allGenes[geneCounter],2*tCounter]
+      }
+    }
+    if(!is.na(EMClass[allGenes[geneCounter],2*tCounter-1])){
+      if(is.na(EMClass[allGenes[geneCounter],2*tCounter])){
+        EMClassCondition[allGenes[geneCounter],conditionNames[tCounter]] &lt;- EMClass[allGenes[geneCounter],2*tCounter-1]
+      }
+      if(!is.na(EMClass[allGenes[geneCounter],2*tCounter])){
+        if(EMClass[allGenes[geneCounter],2*tCounter-1] == EMClass[allGenes[geneCounter],2*tCounter]){
+          EMClassCondition[allGenes[geneCounter],conditionNames[tCounter]] &lt;- EMClass[allGenes[geneCounter],2*tCounter-1]}
+        if(!(EMClass[allGenes[geneCounter],2*tCounter-1] == EMClass[allGenes[geneCounter],2*tCounter])){
+          EMClassCondition[allGenes[geneCounter],conditionNames[tCounter]] &lt;- NA}
+      }
+    }
+  }
+}
+saveRDS(EMClassCondition, file.path(results_dir,&quot;EMClassCondition.rds&quot;))</code></pre>
+</div>
+<div id="network-metrics" class="section level2">
+<h2>Network metrics</h2>
+<p>Using the igraph R package, we compute some metrics for each network including transitivity, connectedness, and mean distance. We also evaluate the number of E and M models present in simulate ddata by binarizing simulated gene expression of previously identified E and M markers</p>
+<pre class="r"><code># 12 - network metrics: some computations to evaluate the generated networks and simulations
+# First, we binarize the simulated expression data for each condition, then count up the expression of E and M genes to identify the number of E and M models
+# We also compute connectivity, transitivity, and mean distance of each network using the igraph package
+
+rm(list=ls())
+library(Binarize)
+library(sRACIPE)
+
+results_dir &lt;- file.path(getwd(),&quot;results&quot;)
+networks_dir &lt;- file.path(results_dir,&quot;network_construction&quot;)
+sim_dir &lt;- file.path(results_dir,&quot;simulations&quot;)
+
+EMClassCondition &lt;- readRDS(file.path(results_dir,&quot;EMClassCondition.rds&quot;))
+
+fileNames &lt;- list.files(sim_dir)
+networkMetrics &lt;- data.frame(Nodes=integer(),Interactions=integer(),PosInt = integer(),
+                             EModels = integer(), MModels = integer(),Connected = logical(),
+                             MGenes = integer(), Egenes = integer(), ModelCount = integer(), 
+                             CellLine = character(), Signal = character(), Dataset = character(), 
+                             transitivity = numeric(), MeanDistance = numeric(), Accuracy = numeric(), 
+                             Filename = character(), MiPos = numeric(), MiNeg = numeric())
+
+hammingTable &lt;- c(0,7,12,17,22,28,35,42,49,56,64,71,79)
+for(fileCounter in seq_along(fileNames)){
+  
+  fileNameTmp &lt;- fileNames[fileCounter]
+  print(fileNameTmp)
+  
+  cellLine &lt;- str_match(fileNameTmp, &quot;(.*?)_&quot;)[,2]
+  signal &lt;- str_match(fileNameTmp, &quot;_(.*?)_&quot;)[,2]
+  posMi &lt;- as.numeric(gsub(&quot;^(?:[^_]+_){2}([^_]+).*&quot;, &quot;\\1&quot;, fileNameTmp))
+  negMi &lt;- gsub(&quot;^(?:[^_]+_){3}([^_]+).*&quot;, &quot;\\1&quot;, fileNameTmp)
+  negMi &lt;- as.numeric(substr(negMi,0,nchar(negMi)-4))
+  
+  condition &lt;- paste0(cellLine, &quot;_&quot;,signal)
+  
+  racipe &lt;- readRDS(file.path(sim_dir,fileNameTmp))
+  racipe &lt;- sracipeNormalize(racipe)
+  expData &lt;- assay(racipe,1)
+  
+  EMGenes &lt;- EMClassCondition[,condition]
+  MState &lt;- EMGenes[!is.na(EMGenes)]
+  circuit &lt;-  as.data.frame(sracipeCircuit(racipe))
+  g &lt;- graph_from_data_frame(circuit, directed = TRUE, vertices = NULL)
+  
+  commonGenes &lt;- rownames(expData)
+  commonGenes &lt;- commonGenes[which(commonGenes %in% names(MState))]
+  expData &lt;- expData[commonGenes,]
+  expData &lt;- Binarize::binarizeMatrix(expData, method = &quot;kMeans&quot;)[,1:dim(expData)[2]]
+  
+  MState &lt;- MState[commonGenes]
+  EState &lt;- !MState
+  expDataTmp &lt;- as.matrix(expData)
+  storage.mode(expDataTmp) &lt;- &quot;logical&quot;
+  if(length(MState)&gt;85) message(&quot;Extend hamming table cutoffs&quot;)
+  hammingCutoff &lt;- findInterval(length(MState),hammingTable)
+  hamDistE &lt;- apply((expDataTmp), 2, function(x) sum(x != EState))
+  hamDistM &lt;- apply((expDataTmp), 2, function(x) sum(x != MState))
+  networkMetricsTmp &lt;- data.frame(Nodes= length(union(circuit$Source,circuit$Target)),
+                                  Interactions=length(circuit$Source),PosInt = length(which(circuit$Type ==1)),
+                                  EModels = length(which(hamDistE &lt; hammingCutoff)), MModels = length(which(hamDistM &lt; hammingCutoff)),
+                                  Connected = igraph::is_connected(g),MGenes = sum(MState), Egenes = sum(EState), 
+                                  ModelCount = sracipeConfig(racipe)$simParams[&quot;numModels&quot;], CellLine = cellLine, 
+                                  Signal = signal, Dataset = condition, Transitivity = igraph::transitivity(g),
+                                  MeanDistance = igraph::mean_distance(g, directed = TRUE, unconnected = FALSE), 
+                                  Filename=fileNameTmp, MiPos = posMi, MiNeg = negMi)
+  networkMetricsTmp$Accuracy &lt;- sum(networkMetricsTmp$EModels + networkMetricsTmp$MModels)/networkMetricsTmp$ModelCount
+  rownames(networkMetricsTmp) &lt;- condition
+  networkMetrics &lt;- rbind(networkMetrics, networkMetricsTmp)
+}
+saveRDS(networkMetrics, file = file.path(networks_dir,&quot;networkMetrics.rds&quot;))</code></pre>
+</div>
+<div id="plot-network-metrics" class="section level2">
+<h2>Plot network metrics</h2>
+<pre class="r"><code>rm(list=ls())
+library(ggplot2)
+
+results_dir &lt;- file.path(getwd(),&quot;results&quot;)
+networks_dir &lt;- file.path(results_dir,&quot;network_construction&quot;)
+sim_dir &lt;- file.path(results_dir,&quot;simulations&quot;)
+networkMetrics &lt;- readRDS(file = file.path(networks_dir,&quot;networkMetrics.rds&quot;))
+
+
+
+networkMetrics &lt;- networkMetrics[networkMetrics$Connected,]
+#networkMetrics &lt;- networkMetrics[which((networkMetrics$MGenes + networkMetrics$Egenes)&gt;4),]
+
+ggplot(networkMetrics) +
+  geom_point(aes(x=Nodes,y=Accuracy), alpha=0.5, size = 0.5) +
+  theme_bw()+
+  xlab(&quot;Number of TFs&quot;) +
+  #  facet_wrap(~Dataset, ncol = 3) +
+  theme(text=element_text(size=20),
+        axis.text.x=element_text(angle=90, hjust=1))
+
+ggplot(networkMetrics) +
+  geom_point(aes(x=Interactions,y=Accuracy),  alpha=0.5, size = 0.5) +
+  theme_bw()+
+  xlab(&quot;Number of Interactions&quot;) +
+  # facet_wrap(~Dataset, ncol = 3) +
+  theme(text=element_text(size=20),
+        axis.text.x=element_text(angle=90, hjust=1))
+
+plotData &lt;- networkMetrics
+plotData$EMNodes &lt;- (networkMetrics$MGenes + networkMetrics$Egenes)/networkMetrics$Nodes
+
+
+ggplot(plotData) +
+  geom_boxplot(aes(x=EMNodes ,y=Accuracy), alpha=0.5, size = 0.5) +
+  theme_bw()+
+  xlab(&quot;Fraction of EM TFs&quot;) +
+  #  facet_wrap(~Dataset, ncol = 3) +
+  theme(text=element_text(size=20),
+        axis.text.x=element_text(angle=90, hjust=1))
+
+
+plotData &lt;- networkMetrics 
+plotData &lt;- plotData[plotData$Connected == TRUE,]
+plotData$DiffFraction &lt;- (plotData$Interactions - plotData$PosInt)/plotData$Interactions
+
+ggplot(plotData, aes(x=Interactions,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Number of Interactions&quot;) +
+  theme_bw() +
+  theme(text=element_text(size=20)
+  )
+
+ggplot(plotData, aes(x=Interactions,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Number of Interactions&quot;) +
+  theme_bw() +
+  theme(text=element_text(size=20)
+  )
+plotData$EMFraction &lt;- (plotData$Egenes+ plotData$MGenes)/plotData$Nodes
+ggplot(plotData, aes(x=EMFraction,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Fraction of EM TFs&quot;) +
+  theme_bw() +
+  theme(text=element_text(size=20)
+  )
+
+
+ggplot(plotData, aes(x=EMFraction,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Fraction of EM TFs&quot;) +
+  theme_bw() +
+  facet_wrap(~Dataset) +
+  theme(text=element_text(size=20)
+  )
+
+ggplot(plotData, aes(x=EMFraction,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Fraction of EM TFs&quot;) +
+  theme_bw() +
+  facet_wrap(~Dataset) +
+  theme(text=element_text(size=20)
+  )
+
+
+
+plotData$posIntFrac &lt;- plotData$PosInt/plotData$Interactions
+ggplot(plotData, aes(x=posIntFrac,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Fraction of Excitatory Interactions&quot;) +
+  theme_bw() +
+  facet_wrap(~Dataset) +
+  theme(text=element_text(size=20)
+  )
+
+plotData$NegIntFrac &lt;- 1- plotData$posIntFrac
+ggplot(plotData, aes(x=NegIntFrac,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Fraction of Inhibitory Interactions&quot;) +
+  theme_bw() +
+  facet_wrap(~Dataset) +
+  theme(text=element_text(size=20)
+  )
+ggplot(plotData, aes(x=EMFraction,y=Accuracy)) +
+  geom_point() +
+  xlab(&quot;Fraction of EM TFs&quot;) +
+  theme_bw() +
+  facet_wrap(~Dataset) +
+  theme(text=element_text(size=20)
+  )</code></pre>
+</div>
+<div id="comparing-experimental-simulated-data" class="section level2">
+<h2>Comparing experimental &amp; simulated data</h2>
+<p>We can plot the experimental and simulated datasets together to visualize whether the simulated data capture the TF activity derived from the experimental data. Here we show the results for the data from OVCA420 cell line with TGFB1 treatment and a network constructed using 0.4 and 0.1 mutual information cutoffs for excitatory and inhibitory interactions.</p>
+<pre class="r"><code># Compare experimental &amp; simulated data - here we take the example of one generated network for 
+# OVCA420_TGFB1 with posMi and negMi cutoffs 0.4 and 0.1, respectively
+
+rm(list=ls())
+library(sRACIPE)
+
+results_dir &lt;- file.path(getwd(),&quot;results&quot;)
+networks_dir &lt;- file.path(results_dir,&quot;network_construction&quot;)
+sim_dir &lt;- file.path(results_dir,&quot;simulations&quot;)
+
+treatments &lt;- c(&quot;EGF&quot;,&quot;TGFB1&quot;, &quot;TNF&quot;)
+cancer_types &lt;- c(&quot;A549&quot;,&quot;DU145&quot;,&quot;MCF7&quot;,&quot;OVCA420&quot;)
+directions &lt;- c(&quot;fwd&quot;,&quot;rev&quot;)
+
+
+c &lt;- cancer_types[4]
+t &lt;- treatments[2]
+posMi &lt;- 0.4
+negMi &lt;- 0.1
+
+# Read the simulated data from the simulations above.
+expRacipe &lt;- readRDS(file.path(sim_dir,paste0(c,&quot;_&quot;,t,&quot;_&quot;,posMi,&quot;_&quot;,negMi,&quot;.rds&quot;)))
+circuit &lt;- sracipeCircuit(expRacipe)
+networkTFs &lt;- union(circuit$Source,circuit$Target)
+expRacipeNorm &lt;- sracipeNormalize(expRacipe)
+expData &lt;- assay(expRacipeNorm,1)
+
+expDataOrig &lt;- assay(expRacipe,1)
+expDataOrig &lt;- log2(1+expDataOrig)
+#expDataOrig &lt;- expDataOrig[commonTfs,]
+
+tmpMeans &lt;- rowMeans(expDataOrig)
+tmpSds &lt;- apply(expDataOrig,1,sd)
+
+seuratFwd &lt;- readRDS(file = file.path(results_dir,paste0(&quot;seurat_regs&quot;,c,&quot;_&quot;,t,&quot;_fwd.Rds&quot;)))
+actFwd &lt;- seuratFwd@assays$RNA@scale.data
+tfNames &lt;- rownames(actFwd)
+tfNames &lt;- substr(tfNames, 0, nchar(tfNames)-3)
+rownames(actFwd) &lt;- substr(rownames(actFwd), 0, nchar(rownames(actFwd))-3)
+commonTfs &lt;- intersect(networkTFs,rownames(actFwd))
+
+seuratRev &lt;- readRDS(file =file.path(results_dir,paste0(&quot;seurat_regs&quot;,c,&quot;_&quot;,t,&quot;_rev.Rds&quot;)))
+actRev &lt;- seuratRev@assays$RNA@scale.data
+tfNames &lt;- rownames(actRev)
+tfNames &lt;- substr(tfNames, 0, nchar(tfNames)-3)
+rownames(actRev) &lt;- substr(rownames(actRev), 0, nchar(rownames(actRev))-3)
+commonTfs &lt;- intersect(commonTfs,rownames(actRev))
+
+expData &lt;- expData[commonTfs,]
+actFwd &lt;- actFwd[commonTfs,]
+actRev &lt;- actRev[commonTfs,]
+
+plotColor &lt;- c(&quot;#5E4FA2&quot;, &quot;#4F61AA&quot;, &quot;#4173B3&quot;, &quot;#3386BC&quot;, &quot;#4198B6&quot;,
+               &quot;#51ABAE&quot;, &quot;#62BEA6&quot;, &quot;#77C8A4&quot;, &quot;#8ED1A4&quot;, &quot;#A4DAA4&quot;,
+               &quot;#B8E2A1&quot;, &quot;#CBEA9D&quot;, &quot;#DEF199&quot;, &quot;#EAF69F&quot;, &quot;#F2FAAC&quot;,
+               &quot;#FAFDB8&quot;, &quot;#FEFAB6&quot;, &quot;#FEF0A5&quot;, &quot;#FEE695&quot;, &quot;#FDD985&quot;,
+               &quot;#FDC978&quot;, &quot;#FDB96A&quot;, &quot;#FCA75E&quot;, &quot;#F99254&quot;, &quot;#F67D4A&quot;,
+               &quot;#F26943&quot;, &quot;#E85A47&quot;, &quot;#DE4B4B&quot;, &quot;#D33C4E&quot;, &quot;#C1284A&quot;,
+               &quot;#AF1446&quot;, &quot;#9E0142&quot;)
+
+pca = prcomp(t(expData), scale. = T, center = T)
+pcaData &lt;- pca$x
+pcaDataFwd &lt;- (scale(t(actFwd), pca$center, pca$scale) %*%
+                 pca$rotation)
+pcaDataFwd &lt;- data.frame(PC1=pcaDataFwd[,1],PC2=pcaDataFwd[,2], Time = seuratFwd$Time)
+pcaDataRev &lt;- (scale(t(actRev), pca$center, pca$scale) %*%
+                 pca$rotation)
+pcaDataRev &lt;- data.frame(PC1=pcaDataRev[,1],PC2=pcaDataRev[,2], Time = seuratRev$Time)
+expDataSim &lt;- data.frame(pca$x[,1:2])
+expDataSim$Time &lt;- &quot;Sim&quot;
+pcaDataFwd$Dir &lt;- &quot;Fwd&quot;
+pcaDataRev$Dir &lt;- &quot;Rev&quot;
+expDataSim$Dir &lt;- &quot;None&quot;
+
+# Fit a linear model to activities from cells from day 7 from forward and
+# reverse directions.
+
+sevenD &lt;- rownames(pcaDataFwd[which(pcaDataFwd$Time == &quot;7d&quot;),])
+sevenDFwd &lt;- pcaDataFwd[sevenD,]$PC1
+sevenDRev  &lt;- pcaDataRev[sevenD,]$PC1
+pred &lt;- pcaDataRev$PC1
+pcaDataRevScaled &lt;- data.frame(PC1 = predict(lm(sevenDFwd ~ sevenDRev),data.frame(sevenDRev = pred)))
+
+sevenDFwd &lt;- pcaDataFwd[sevenD,]$PC2
+sevenDRev  &lt;- pcaDataRev[sevenD,]$PC2
+pred &lt;- pcaDataRev$PC2
+pcaDataRevScaled$PC2 &lt;- predict(lm(sevenDFwd ~ sevenDRev),data.frame(sevenDRev = pred))
+
+pcaDataRevScaled$Time &lt;- pcaDataRev$Time
+pcaDataRevScaled$Dir &lt;- pcaDataRev$Dir
+allData &lt;- rbind(expDataSim, pcaDataFwd,pcaDataRevScaled)
+
+p &lt;- ggplot2::ggplot(allData) +
+  #    geom_point(aes(x = allData[,1], y =allData[,2], color = Time, shape = Dir), alpha = 0.5) +
+  xlab(paste0(&quot;PC1(&quot;,100*summary(pca)$importance[2,1],&quot;%)&quot;)) +
+  ylab(paste0(&quot;PC2(&quot;,100*summary(pca)$importance[2,2],&quot;%)&quot;)) +
+  #    stat_summary(aes(x = allData[,1], y =allData[,2], group=Dir, color = Dir), fun.y=mean, geom=&quot;line&quot;) +
+  geom_point(aes(x = allData[,1], y =allData[,2], group=Dir, color = Time, shape = Dir), alpha = 0.5) +
+  theme_bw() +
+  theme(text = element_text(size=15)) +
+  xlim(-5,11) +
+  ylim(-5,4)
+p</code></pre>
+</div>
+<div id="parametric-peturbations-of-simulated-models" class="section level2">
+<h2>Parametric peturbations of simulated models</h2>
+<p>We can modify the parameters for selected models and simulate the circuit with modified parameters. Here, we increased the production rate of JUN and RELB and used the steady state values from unperturbed simulations as the initial conditions for new stochastic simulations. For more details, please see <a href="https://vivekkohar.github.io/sRACIPE/articles/articles/simulatingTrajectories.html" class="uri">https://vivekkohar.github.io/sRACIPE/articles/articles/simulatingTrajectories.html</a></p>
+<pre class="r"><code>rm(list=ls())
+library(sRACIPE)
+library(ggplot2)
+
+results_dir &lt;- file.path(getwd(),&quot;results&quot;)
+networks_dir &lt;- file.path(results_dir,&quot;network_construction&quot;)
+sim_dir &lt;- file.path(results_dir,&quot;simulations&quot;)
+perturb_dir &lt;- file.path(results_dir,&quot;perturbation_simulations&quot;)
+if(!dir.exists(perturb_dir)) {
+  dir.create(perturb_dir)
+}
+
+treatments &lt;- c(&quot;EGF&quot;,&quot;TGFB1&quot;, &quot;TNF&quot;)
+cancer_types &lt;- c(&quot;A549&quot;,&quot;DU145&quot;,&quot;MCF7&quot;,&quot;OVCA420&quot;)
+directions &lt;- c(&quot;fwd&quot;,&quot;rev&quot;)
+
+
+c &lt;- cancer_types[4]
+t &lt;- treatments[2]
+posMi &lt;- 0.4
+negMi &lt;- 0.1
+
+# Read the simulated data from the simulations above.
+newRacipe &lt;- readRDS(file.path(sim_dir,paste0(c,&quot;_&quot;,t,&quot;_&quot;,posMi,&quot;_&quot;,negMi,&quot;.rds&quot;)))
+#newRacipe &lt;- readRDS(file.path(&quot;eModelsRacipe.rds&quot;))
+tmp &lt;- sracipeParams(newRacipe)
+tmp[,&quot;G_JUN&quot;] &lt;- 10000*tmp[,&quot;G_JUN&quot;]
+tmp[,&quot;G_RELB&quot;] &lt;- 10000*tmp[,&quot;G_RELB&quot;]
+sracipeParams(newRacipe) &lt;- tmp
+tmp &lt;- assay(newRacipe,1)
+sracipeIC(newRacipe) &lt;- (tmp)
+set.seed(123)
+newRacipe2_D05_T2000 &lt;-  sracipeSimulate(
+  newRacipe, numModels = 2000, initialNoise = 0.05,simDet = FALSE,
+  nNoise=0,stepper = &quot;EM&quot;, plots = FALSE,integrateStepSize = 0.01,
+  genParams = FALSE,genIC = FALSE, simulationTime = 2000)
+
+saveRDS(newRacipe2_D05_T2000, file = file.path(perturb_dir,&quot;eModelsRacipe_D05_T2000.rds&quot;))
+
+# We can instead also record the state of the models at multiple time points,
+# for example, here we record the state at every 0.02 time. 
+
+newRacipeTime &lt;-  sracipeSimulate(
+  newRacipe, numModels = 2000, initialNoise = 0.05,simDet = FALSE,
+  nNoise=0,stepper = &quot;EM&quot;, plots = FALSE,integrateStepSize = 0.01,
+  genParams = FALSE,genIC = FALSE, simulationTime = 50, printInterval = 0.02, printStart = 0)
+
+saveRDS(newRacipeTime, file = file.path(perturb_dir,&quot;eModelsRacipe_D05_T50_interval02.rds&quot;))</code></pre>
 </div>
 
 
